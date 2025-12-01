@@ -53,8 +53,7 @@ class MAGNN_metapath_specific(nn.Module):
             nn.GELU(),
             nn.Linear(4 * self.out_dim, self.out_dim),
         )
-
-
+        
 
 
         # node-level attention
@@ -130,32 +129,17 @@ class MAGNN_metapath_specific(nn.Module):
             sa_in = self.sa_ln1(tokens)  # [Seq,E,d]
             sa_out, _ = self.self_mha(sa_in, sa_in, sa_in, key_padding_mask=key_padding_mask)
             tokens = tokens + sa_out
-            # ② 从 tokens 读出实例向量（掩码平均）
-            sa_out = tokens.permute(1, 0, 2)
-            valid = (~key_padding_mask).float()
-            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
-            inst_emb = (sa_out * valid.unsqueeze(-1)).sum(dim=1) / denom  # [E,d]
-            # ③ FFN：先 LN 再 FFN，然后残差（不再跟 LN）
-            inst_in = self.sa_ln2(inst_emb)
-            inst_emb = inst_emb + self.sa_ff(inst_in)
-
-            # --- 计算每条实例的“最后真实位置”的 target 节点 id
+            # ② 直接取“中心/目标节点 token”（最后一个非PAD位置）
             lengths = (~key_padding_mask).sum(dim=1)  # [E]
-            last_pos = (lengths - 1).clamp_min(0)  # [E]
-            last_ids = edge_metapath_indices.gather(1, last_pos.view(-1, 1)).squeeze(1)  # [E]
+            last_pos = (lengths - 1).clamp_min(0).long()  # [E]
+            tokens_e = tokens.permute(1, 0, 2)  # [E, Seq, d]
+            inst_emb = tokens_e[torch.arange(E, device=tokens.device), last_pos]  # [E, d]
 
-            # target 节点向量（Query）
-            target_feat = F.embedding(last_ids, features)
-            # Cross-Attention: Q = target_feat (len=1), K/V = sa_out 的序列
-            q = self.ca_ln1(target_feat).unsqueeze(0)  # [1, E, d]  先LN(Pre-LN)
-            k = sa_out.permute(1, 0, 2)  # [Seq, E, d]
-            v = k
-            cross_out, _ = self.cross_mha(q, k, v, key_padding_mask=key_padding_mask)
-            inst_emb = inst_emb + cross_out.squeeze(0)  # 残差，不再跟LN
-            # FFN 前再LN一次（Pre-LN）
-            inst_emb = inst_emb + self.ca_ff(self.ca_ln2(inst_emb))
+            # ③ FFN：Pre-LN + FFN + residual（保留你的稳定结构）
+            inst_emb = inst_emb + self.sa_ff(self.sa_ln2(inst_emb))  # [E, d]
 
-            hidden = self.inst_to_heads(inst_emb).unsqueeze(0)     # [1, E, H*d]
+            # 输出到多头空间，与后面 eft/edge_softmax 部分兼容
+            hidden = self.inst_to_heads(inst_emb).unsqueeze(0)
 
 
 
